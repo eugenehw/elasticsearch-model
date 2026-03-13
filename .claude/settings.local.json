@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(gem install:*)",
-      "Bash(ruby spec/criteria_spec.rb)",
-      "Bash(ruby spec/influencer_example.rb)"
-    ]
-  }
-}
