@@ -4,7 +4,7 @@ module Elasticsearch
   module Model
     # Evaluated inside Criteria#query { } blocks.
     # Inherits all query-building methods from ClauseContext and adds:
-    #   - filter { } — communicates back to the Criteria via @_criteria_ref
+    #   - filter/must/should/must_not { } — shorthand for bool { filter/... { } }
     #   - QueryFilter helpers (smart_match, date_range, filter_terms)
     #   - Model-specific QueryFilter helpers (MyModel::QueryFilter)
     class QueryContext < ClauseContext
@@ -19,11 +19,26 @@ module Elasticsearch
         extend(model_qf_mod) if model_qf_mod
       end
 
-      # filter {} inside a query {} block — pushes clauses into the temp buffer.
-      def filter(&block)
-        collector = FilterCollector.new(@_filter_module)
-        collector.instance_exec(&block)
-        @_filter_buf.concat(collector.clauses)
+      # Shorthand: filter/must/should/must_not {} inside query {} wraps in bool automatically.
+      def filter(&block);   bool_wrap(:filter,   &block); end
+      def must(&block);     bool_wrap(:must,     &block); end
+      def should(&block);   bool_wrap(:should,   &block); end
+      def must_not(&block); bool_wrap(:must_not, &block); end
+
+      # Override bool to propagate the model's QueryFilter module into BoolContext,
+      # so that scope methods are available inside nested filter/must/should blocks.
+      def bool(&block)
+        bc = BoolContext.new(@_filter_module)
+        bc.instance_exec(&block) if block_given?
+        @clauses << bc.to_h
+      end
+
+      private
+
+      def bool_wrap(clause_type, &block)
+        bc = BoolContext.new(@_filter_module)
+        bc.public_send(clause_type, &block)
+        @clauses << bc.to_h
       end
     end
   end

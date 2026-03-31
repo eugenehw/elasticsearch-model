@@ -38,6 +38,8 @@ module Elasticsearch
         @from_value       = nil
         @size_value       = nil
         @source_fields    = nil
+        @track_total_hits = nil
+        @script_fields    = nil
       end
 
       # ── DSL Builders ─────────────────────────────────────────────────────────
@@ -63,8 +65,38 @@ module Elasticsearch
         reset_compiled!
         if block_given?
           collector = build_filter_collector
-          collector.instance_exec(&block)
+          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
           @filter_clauses.concat(collector.clauses)
+        end
+        self
+      end
+
+      def must(&block)
+        reset_compiled!
+        if block_given?
+          collector = build_filter_collector
+          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
+          @must_clauses.concat(collector.clauses)
+        end
+        self
+      end
+
+      def should(&block)
+        reset_compiled!
+        if block_given?
+          collector = build_filter_collector
+          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
+          @should_clauses.concat(collector.clauses)
+        end
+        self
+      end
+
+      def must_not(&block)
+        reset_compiled!
+        if block_given?
+          collector = build_filter_collector
+          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
+          @must_not_clauses.concat(collector.clauses)
         end
         self
       end
@@ -95,6 +127,18 @@ module Elasticsearch
       def source(*fields)
         reset_compiled!
         @source_fields = fields.flatten
+        self
+      end
+
+      def track_total_hits(value = true)
+        reset_compiled!
+        @track_total_hits = value
+        self
+      end
+
+      def script_fields(hash)
+        reset_compiled!
+        @script_fields = deep_stringify(hash)
         self
       end
 
@@ -230,19 +274,20 @@ module Elasticsearch
             )
             body['search_after'] = search_after if search_after
 
-            raw = Elasticsearch::Model.client.search(
-              index:   '_all',
+            raw = Elasticsearch::Model.client.search_pit(
               body:    body,
               timeout: timeout,
               params:  {}
             )
 
-            response   = build_response(raw)
-            pit_id     = response.pit_id || pit_id
+            response = build_response(raw)
+            pit_id   = response.pit_id || pit_id
+
+            break if response.empty?
+
             cumulative += response.size
             responses  << response
 
-            break if response.empty?
             break if block && !block.call(response, cumulative)
 
             search_after = response.last_sort
@@ -265,6 +310,7 @@ module Elasticsearch
       def to_query
         @_compiled ||= compile
       end
+      alias to_h to_query
 
       def reset_compiled!
         @_compiled = nil
@@ -284,8 +330,17 @@ module Elasticsearch
         # Aggregations
         agg_hash = {}
         @agg_blocks.each do |name, blk|
-          ab = AggBuilder.new(name, model_filter_module)
-          blk.arity == 0 ? ab.instance_exec(&blk) : blk.call(ab)
+          ab = AggBuilder.new(name, @model_class)
+          case blk.arity
+          when 0
+            ab.instance_exec(&blk)
+          when 1
+            blk.call(ab)
+          else
+            f = FilterCollector.new(model_filter_module)
+            ab.f_ref = f
+            blk.call(ab, f)
+          end
           agg_hash[name.to_s] = ab.build
         end
         @raw_agg_hashes.each do |name, raw|
@@ -299,10 +354,12 @@ module Elasticsearch
           h['sort'] = sort_clauses unless sort_clauses.empty?
         end
 
-        h['highlight'] = {} if @highlight_block   # placeholder; extend as needed
-        h['from']      = @from_value              if @from_value
-        h['size']      = @size_value              if @size_value
-        h['_source']   = @source_fields           if @source_fields
+        h['highlight']          = {} if @highlight_block   # placeholder; extend as needed
+        h['from']               = @from_value              if @from_value
+        h['size']               = @size_value              if @size_value
+        h['_source']            = @source_fields           if @source_fields
+        h['track_total_hits']   = @track_total_hits        unless @track_total_hits.nil?
+        h['script_fields']      = @script_fields           if @script_fields
 
         h
       end
@@ -347,17 +404,39 @@ module Elasticsearch
 
       # ── Helpers ──────────────────────────────────────────────────────────────
 
-      # Delegate model QueryFilter methods directly on the Criteria object.
-      # e.g. @criteria.team_id(val)  →  adds filter clause via BrandContent::QueryFilter#team_id
+      # Delegate agg_scope and QueryFilter methods directly on Criteria.
+      # Agg scopes take priority; QueryFilter methods add filter clauses.
       def method_missing(name, *args, **kwargs, &block)
+        # Agg scopes take priority
+        if @model_class.respond_to?(:_agg_scopes) && (defn = @model_class._agg_scopes[name.to_sym])
+          accum = AggAccumulator.new(@model_class)
+          f = accum.f
+          case defn.arity
+          when 0 then accum.instance_exec(&defn)
+          when 1 then defn.call(accum)
+          else        defn.call(accum, f)
+          end
+          if block
+            main_ab = accum.last_agg_builder
+            if main_ab
+              case block.arity
+              when 0 then main_ab.instance_exec(&block)
+              when 1 then block.call(main_ab)
+              else        block.call(main_ab, f)
+              end
+            end
+          end
+          accum.to_raw_aggs.each { |n, raw| aggregate(n, raw) }
+          return self
+        end
+
+        # QueryFilter methods
         mod = model_filter_module
         if mod && mod.method_defined?(name)
           reset_compiled!
           filter_buf = []
           ctx = QueryContext.new(filter_buf, mod)
           kwargs.empty? ? ctx.public_send(name, *args, &block) : ctx.public_send(name, *args, **kwargs, &block)
-          # Collect both direct clause additions (term/terms/bool/raw) and filter_buf
-          # additions (date_range / filter_terms / filter {}).
           @filter_clauses.concat(ctx.clauses)
           @filter_clauses.concat(filter_buf)
           self
@@ -367,8 +446,9 @@ module Elasticsearch
       end
 
       def respond_to_missing?(name, include_private = false)
-        mod = model_filter_module
-        (mod && mod.method_defined?(name)) || super
+        (@model_class.respond_to?(:_agg_scopes) && @model_class._agg_scopes.key?(name.to_sym)) ||
+          (model_filter_module&.method_defined?(name)) ||
+          super
       end
 
       def build_filter_collector

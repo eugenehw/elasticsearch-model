@@ -2,7 +2,7 @@
 
 # spec/criteria_spec.rb  (minitest)
 
-$LOAD_PATH.unshift File.expand_path('../lib', __dir__)
+$LOAD_PATH.unshift File.expand_path('./lib', __dir__)
 require 'elasticsearch/model'
 require 'minitest/autorun'
 require 'date'
@@ -24,15 +24,54 @@ class MockModel
     end
   end
 
+  # Scopes — add named filter methods to QueryFilter
+  scope :active do
+    term 'status', 'active'
+  end
+
+  scope :deleted do
+    term 'status', 'deleted'
+  end
+
   # Model-specific QueryFilter helpers — available in both query {} and filter {} blocks
   module QueryFilter
     def platform(value)
       term 'platform', value
     end
+  end
 
-    def active
-      term 'status', 'active'
+  # Agg scopes
+  agg_scope :group_by_status do |agg, f|
+    agg.aggregate(:status) do |status_agg|
+      status_agg.filters(:active)  { f.active }
+      status_agg.filters(:deleted) { f.deleted }
     end
+  end
+
+  agg_scope :group_by_team do |agg|
+    agg.aggregate(:teams) do
+      terms field: 'team', size: 10
+    end
+  end
+
+  agg_scope :timeline do |agg|
+    agg.aggregate(:timeline) do
+      date_histogram field: 'published_at', calendar_interval: 'month'
+    end
+  end
+
+  agg_scope :team_with_status do |agg, f|
+    agg.group_by_team do |teams_agg|
+      teams_agg.group_by_status
+    end
+  end
+
+  agg_scope :by_platform_source do |a|
+    a.aggregate(:platform) { terms field: 'platform' }
+  end
+
+  agg_scope :by_status_source do |a|
+    a.aggregate(:status_source) { terms field: 'status' }
   end
 
   # Custom response class
@@ -145,14 +184,6 @@ class CriteriaTest < Minitest::Test
     assert_includes filters, { 'exists' => { 'field' => 'name' } }
   end
 
-  def test_filter_inside_query_block
-    c = MockModel.query do
-      filter { term 'platform', 'instagram' }
-    end
-    filters = c.to_query.dig('query', 'bool', 'filter')
-    assert_equal [{ 'term' => { 'platform' => 'instagram' } }], filters
-  end
-
   def test_filter_merges_with_query_bool_filter
     c = MockModel.query { date_range :published_at, from: '2025-01-01' }
                  .filter { term 'platform', 'instagram' }
@@ -166,18 +197,6 @@ class CriteriaTest < Minitest::Test
 
   def test_model_query_filter_in_filter_block
     c = MockModel.filter { platform 'instagram' }
-    filters = c.to_query.dig('query', 'bool', 'filter')
-    assert_includes filters, { 'term' => { 'platform' => 'instagram' } }
-  end
-
-  def test_model_query_filter_in_query_block
-    c = MockModel.query { active }
-    q = c.to_query
-    assert_equal({ 'term' => { 'status' => 'active' } }, q['query'])
-  end
-
-  def test_model_query_filter_inside_query_filter_block
-    c = MockModel.query { filter { platform 'instagram' } }
     filters = c.to_query.dig('query', 'bool', 'filter')
     assert_includes filters, { 'term' => { 'platform' => 'instagram' } }
   end
@@ -276,10 +295,501 @@ class CriteriaTest < Minitest::Test
     assert_equal({ 'term' => { 'status' => 'deleted' } }, aggs.dig('status', 'filters', 'filters', 'deleted'))
   end
 
+  # ── scope macro ──────────────────────────────────────────────────────────────
+
+  def test_scope_adds_method_to_query_filter
+    assert MockModel::QueryFilter.method_defined?(:active)
+    assert MockModel::QueryFilter.method_defined?(:deleted)
+  end
+
+  def test_scope_usable_in_filter_block_zero_arity
+    c = MockModel.filter { active }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'term' => { 'status' => 'active' } }
+  end
+
+  def test_scope_usable_in_filter_block_one_arity
+    c = MockModel.filter { |f| f.active }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'term' => { 'status' => 'active' } }
+  end
+
+  def test_scope_auto_creates_query_filter_module
+    model = Class.new do
+      include Elasticsearch::Model::Searchable
+      scope :published do
+        term 'published', true
+      end
+    end
+    assert model.const_defined?(:QueryFilter, false)
+    assert model::QueryFilter.method_defined?(:published)
+  end
+
+  # ── to_h alias ───────────────────────────────────────────────────────────────
+
+  def test_to_h_alias_for_to_query
+    c = MockModel.filter { active }
+    assert_equal c.to_query, c.to_h
+  end
+
+  # ── filters(:name) flat API ──────────────────────────────────────────────────
+
+  def test_filters_named_bucket_flat_api
+    c = MockModel.aggregate(:status) do |agg|
+      agg.filters(:active)  { term 'status', 'active' }
+      agg.filters(:deleted) { term 'status', 'deleted' }
+    end
+    aggs = c.to_query['aggregations']
+    assert_equal({ 'term' => { 'status' => 'active' } },  aggs.dig('status', 'filters', 'filters', 'active'))
+    assert_equal({ 'term' => { 'status' => 'deleted' } }, aggs.dig('status', 'filters', 'filters', 'deleted'))
+  end
+
+  def test_filters_named_bucket_with_scope
+    c = MockModel.aggregate(:status) do |agg, f|
+      agg.filters(:active)  { f.active }
+      agg.filters(:deleted) { f.deleted }
+    end
+    aggs = c.to_query['aggregations']
+    assert_equal({ 'term' => { 'status' => 'active' } },  aggs.dig('status', 'filters', 'filters', 'active'))
+    assert_equal({ 'term' => { 'status' => 'deleted' } }, aggs.dig('status', 'filters', 'filters', 'deleted'))
+  end
+
+  # ── bool { should { } } with scopes ─────────────────────────────────────────
+
+  def test_bool_with_should_and_scopes
+    c = MockModel.filter do
+      bool do
+        should do
+          active
+          deleted
+        end
+        minimum_should_match 1
+      end
+    end
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    bool_clause = filters.find { |f| f['bool'] }
+    assert bool_clause, 'expected bool clause'
+    should_clauses = bool_clause.dig('bool', 'should')
+    assert_instance_of Array, should_clauses
+    assert_includes should_clauses, { 'term' => { 'status' => 'active' } }
+    assert_includes should_clauses, { 'term' => { 'status' => 'deleted' } }
+    assert_equal 1, bool_clause.dig('bool', 'minimum_should_match')
+  end
+
+  # ── agg_scope ────────────────────────────────────────────────────────────────
+
+  def test_agg_scope_defines_class_method
+    assert MockModel.respond_to?(:group_by_status)
+    assert MockModel.respond_to?(:group_by_team)
+    assert MockModel.respond_to?(:timeline)
+  end
+
+  def test_agg_scope_returns_criteria
+    c = MockModel.group_by_status
+    assert_instance_of Elasticsearch::Model::Criteria, c
+  end
+
+  def test_agg_scope_group_by_status_builds_filters_agg
+    aggs = MockModel.group_by_status.to_query['aggregations']
+    assert aggs.key?('status'), "expected 'status' key"
+    assert_equal({ 'term' => { 'status' => 'active' } },  aggs.dig('status', 'filters', 'filters', 'active'))
+    assert_equal({ 'term' => { 'status' => 'deleted' } }, aggs.dig('status', 'filters', 'filters', 'deleted'))
+  end
+
+  def test_agg_scope_group_by_team_builds_terms_agg
+    aggs = MockModel.group_by_team.to_query['aggregations']
+    assert aggs.key?('teams'), "expected 'teams' key"
+    assert_equal({ 'field' => 'team', 'size' => 10 }, aggs.dig('teams', 'terms'))
+  end
+
+  def test_agg_scope_timeline_builds_date_histogram
+    aggs = MockModel.timeline.to_query['aggregations']
+    assert aggs.key?('timeline'), "expected 'timeline' key"
+    assert_equal 'published_at', aggs.dig('timeline', 'date_histogram', 'field')
+    assert_equal 'month', aggs.dig('timeline', 'date_histogram', 'calendar_interval')
+  end
+
+  def test_agg_scope_returns_chainable_criteria
+    c = MockModel.group_by_team
+    assert_instance_of Elasticsearch::Model::Criteria, c
+    assert_equal 0, c.size(0).to_query['size']
+  end
+
+  def test_agg_scope_with_call_time_sub_agg_block
+    c = MockModel.group_by_status do |agg|
+      agg.aggregate(:reach) { sum field: 'reach' }
+    end
+    aggs = c.to_query['aggregations']
+    assert_equal({ 'term' => { 'status' => 'active' } }, aggs.dig('status', 'filters', 'filters', 'active'))
+    assert_equal({ 'field' => 'reach' }, aggs.dig('status', 'aggs', 'reach', 'sum'))
+  end
+
+  def test_agg_scope_sibling_chaining
+    aggs = MockModel.group_by_team.group_by_status.timeline.to_query['aggregations']
+    assert aggs.key?('teams'),    "expected 'teams'"
+    assert aggs.key?('status'),   "expected 'status'"
+    assert aggs.key?('timeline'), "expected 'timeline'"
+  end
+
+  def test_agg_scope_nested_team_with_status
+    aggs = MockModel.team_with_status.to_query['aggregations']
+    assert aggs.key?('teams'), "expected 'teams' key"
+    assert_equal({ 'field' => 'team', 'size' => 10 }, aggs.dig('teams', 'terms'))
+    assert aggs.dig('teams', 'aggs', 'status'), "expected nested 'status' agg"
+    assert_equal(
+      { 'term' => { 'status' => 'active' } },
+      aggs.dig('teams', 'aggs', 'status', 'filters', 'filters', 'active')
+    )
+  end
+
+  def test_agg_scope_on_criteria_via_method_missing
+    c = MockModel.criteria.group_by_status
+    assert_instance_of Elasticsearch::Model::Criteria, c
+    aggs = c.to_query['aggregations']
+    assert aggs.key?('status')
+  end
+
+  def test_agg_scope_respond_to_on_criteria
+    c = MockModel.criteria
+    assert c.respond_to?(:group_by_status)
+  end
+
   # ── custom response class ────────────────────────────────────────────────────
 
   def test_custom_response_class_detected
     assert_equal MockModel::Response, MockModel.response_class
+  end
+
+  # ── FilterCollector clause methods ────────────────────────────────────────────
+
+  def test_filter_terms_clause
+    c = MockModel.filter { terms 'platform', %w[instagram tiktok] }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'terms' => { 'platform' => %w[instagram tiktok] } }
+  end
+
+  def test_filter_match_clause
+    c = MockModel.filter { match 'name', 'john' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'match' => { 'name' => 'john' } }
+  end
+
+  def test_filter_match_phrase_clause
+    c = MockModel.filter { match_phrase 'bio', 'content creator' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'match_phrase' => { 'bio' => 'content creator' } }
+  end
+
+  def test_filter_prefix_clause
+    c = MockModel.filter { prefix 'name', 'joh' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'prefix' => { 'name' => { 'value' => 'joh' } } }
+  end
+
+  def test_filter_wildcard_clause
+    c = MockModel.filter { wildcard 'name', 'jo*' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'wildcard' => { 'name' => { 'value' => 'jo*' } } }
+  end
+
+  def test_filter_ids_clause
+    c = MockModel.filter { ids [1, 2, 3] }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'ids' => { 'values' => [1, 2, 3] } }
+  end
+
+  def test_filter_raw_clause
+    raw_clause = { 'term' => { 'custom_field' => 'custom_value' } }
+    c = MockModel.filter { raw(raw_clause) }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, raw_clause
+  end
+
+  # ── Criteria-level must / should / must_not ────────────────────────────────
+
+  def test_criteria_must_single
+    c = MockModel.must { term 'status', 'active' }
+    assert_equal({ 'term' => { 'status' => 'active' } },
+                 c.to_query.dig('query', 'bool', 'must'))
+  end
+
+  def test_criteria_must_accumulates_multiple
+    c = MockModel.must { term 'status', 'active' }
+                 .must { term 'platform', 'instagram' }
+    must = c.to_query.dig('query', 'bool', 'must')
+    assert_instance_of Array, must
+    assert_equal 2, must.size
+    assert_includes must, { 'term' => { 'status' => 'active' } }
+    assert_includes must, { 'term' => { 'platform' => 'instagram' } }
+  end
+
+  def test_criteria_should_multiple
+    c = MockModel.should { term 'platform', 'instagram' }
+                 .should { term 'platform', 'tiktok' }
+    should_clauses = c.to_query.dig('query', 'bool', 'should')
+    assert_instance_of Array, should_clauses
+    assert_equal 2, should_clauses.size
+    assert_includes should_clauses, { 'term' => { 'platform' => 'instagram' } }
+    assert_includes should_clauses, { 'term' => { 'platform' => 'tiktok' } }
+  end
+
+  def test_criteria_must_not_single
+    c = MockModel.must_not { term 'status', 'deleted' }
+    assert_equal({ 'term' => { 'status' => 'deleted' } },
+                 c.to_query.dig('query', 'bool', 'must_not'))
+  end
+
+  def test_bool_builder_minimum_should_match
+    c = MockModel.criteria
+    c.bool.should { |f| f.term('platform', 'instagram') }
+    c.bool.should { |f| f.term('platform', 'tiktok') }
+    c.bool.minimum_should_match(1)
+    assert_equal 1, c.to_query.dig('query', 'bool', 'minimum_should_match')
+  end
+
+  # ── Query context clause methods ───────────────────────────────────────────
+
+  def test_query_terms_clause
+    c = MockModel.query { terms 'platform', %w[instagram tiktok] }
+    assert_equal({ 'terms' => { 'platform' => %w[instagram tiktok] } },
+                 c.to_query['query'])
+  end
+
+  def test_query_multi_match_clause
+    c = MockModel.query { multi_match('john', fields: %w[name bio]) }
+    q = c.to_query['query']
+    assert_equal 'john',        q.dig('multi_match', 'query')
+    assert_equal %w[name bio],  q.dig('multi_match', 'fields')
+  end
+
+  def test_query_string_clause
+    c = MockModel.query { query_string('john AND smith') }
+    assert_equal 'john AND smith', c.to_query.dig('query', 'query_string', 'query')
+  end
+
+  def test_query_nested_clause
+    c = MockModel.query { nested('tags') { term 'tags.name', 'ruby' } }
+    q = c.to_query['query']
+    assert_equal 'tags', q.dig('nested', 'path')
+    assert_equal({ 'term' => { 'tags.name' => 'ruby' } }, q.dig('nested', 'query'))
+  end
+
+  def test_query_knn_clause
+    c = MockModel.query { knn('embedding', query_vector: [1.0, 0.5], k: 5, num_candidates: 100) }
+    knn = c.to_query.dig('query', 'knn')
+    assert_equal 'embedding', knn['field']
+    assert_equal 5,   knn['k']
+    assert_equal 100, knn['num_candidates']
+  end
+
+  # ── Aggregate metric methods ───────────────────────────────────────────────
+
+  def test_aggregate_avg
+    aggs = MockModel.aggregate(:avg_f) { avg field: 'follower_count' }.to_query['aggregations']
+    assert_equal({ 'field' => 'follower_count' }, aggs.dig('avg_f', 'avg'))
+  end
+
+  def test_aggregate_sum
+    aggs = MockModel.aggregate(:total) { sum field: 'reach' }.to_query['aggregations']
+    assert_equal({ 'field' => 'reach' }, aggs.dig('total', 'sum'))
+  end
+
+  def test_aggregate_max
+    aggs = MockModel.aggregate(:max_f) { max field: 'followers' }.to_query['aggregations']
+    assert_equal({ 'field' => 'followers' }, aggs.dig('max_f', 'max'))
+  end
+
+  def test_aggregate_min
+    aggs = MockModel.aggregate(:min_f) { min field: 'followers' }.to_query['aggregations']
+    assert_equal({ 'field' => 'followers' }, aggs.dig('min_f', 'min'))
+  end
+
+  def test_aggregate_cardinality
+    aggs = MockModel.aggregate(:uniq) { cardinality field: 'user_id' }.to_query['aggregations']
+    assert_equal({ 'field' => 'user_id' }, aggs.dig('uniq', 'cardinality'))
+  end
+
+  def test_aggregate_value_count
+    aggs = MockModel.aggregate(:cnt) { value_count field: 'user_id' }.to_query['aggregations']
+    assert_equal({ 'field' => 'user_id' }, aggs.dig('cnt', 'value_count'))
+  end
+
+  def test_aggregate_missing
+    aggs = MockModel.aggregate(:no_cat) { missing field: 'category' }.to_query['aggregations']
+    assert_equal({ 'field' => 'category' }, aggs.dig('no_cat', 'missing'))
+  end
+
+  def test_aggregate_stats
+    aggs = MockModel.aggregate(:stats_f) { stats field: 'score' }.to_query['aggregations']
+    assert_equal({ 'field' => 'score' }, aggs.dig('stats_f', 'stats'))
+  end
+
+  def test_aggregate_percentiles
+    aggs = MockModel.aggregate(:pct) { percentiles field: 'latency', percents: [50, 95, 99] }
+                    .to_query['aggregations']
+    pct = aggs.dig('pct', 'percentiles')
+    assert_equal 'latency',      pct['field']
+    assert_equal [50, 95, 99],   pct['percents']
+  end
+
+  def test_aggregate_top_hits
+    aggs = MockModel.aggregate(:top) { top_hits size: 3 }.to_query['aggregations']
+    assert_equal({ 'size' => 3 }, aggs.dig('top', 'top_hits'))
+  end
+
+  # ── Pipeline aggregations ──────────────────────────────────────────────────
+
+  def test_aggregate_sum_bucket
+    c = MockModel.aggregate(:total_sales) do |a|
+      a.sum_bucket(buckets_path: 'by_month>sales')
+    end
+    aggs = c.to_query['aggregations']
+    assert_equal({ 'buckets_path' => 'by_month>sales' }, aggs.dig('total_sales', 'sum_bucket'))
+  end
+
+  def test_aggregate_bucket_script
+    c = MockModel.aggregate(:rate) do |a|
+      a.bucket_script(
+        buckets_path: { 'eng' => 'engagement>value', 'fol' => 'followers>value' },
+        script: 'params.eng / params.fol'
+      )
+    end
+    aggs = c.to_query['aggregations']
+    bs = aggs.dig('rate', 'bucket_script')
+    assert_equal 'params.eng / params.fol', bs['script']
+    assert_equal({ 'eng' => 'engagement>value', 'fol' => 'followers>value' }, bs['buckets_path'])
+  end
+
+  # ── Composite aggregation ──────────────────────────────────────────────────
+
+  def test_aggregate_composite_inline_sources
+    c = MockModel.aggregate(:by_combo) do |a|
+      a.composite do
+        size 20
+        sources do
+          aggregate(:platform) { terms field: 'platform' }
+          aggregate(:status)   { terms field: 'status' }
+        end
+      end
+    end
+    aggs  = c.to_query['aggregations']
+    comp  = aggs.dig('by_combo', 'composite')
+    assert_equal 20, comp['size']
+    assert_equal [
+      { 'platform' => { 'terms' => { 'field' => 'platform' } } },
+      { 'status'   => { 'terms' => { 'field' => 'status' } } }
+    ], comp['sources']
+  end
+
+  def test_aggregate_composite_with_agg_scope_sources
+    c = MockModel.aggregate(:by_combo) do |a|
+      a.composite do
+        size 10
+        sources do
+          by_platform_source
+          by_status_source
+        end
+      end
+    end
+    aggs    = c.to_query['aggregations']
+    sources = aggs.dig('by_combo', 'composite', 'sources')
+    assert_equal 2, sources.size
+    assert_equal({ 'terms' => { 'field' => 'platform' } }, sources[0]['platform'])
+    assert_equal({ 'terms' => { 'field' => 'status' } },   sources[1]['status_source'])
+  end
+
+  # ── Criteria top-level params ──────────────────────────────────────────────
+
+  def test_track_total_hits_true
+    c = MockModel.criteria.track_total_hits
+    assert_equal true, c.to_query['track_total_hits']
+  end
+
+  def test_track_total_hits_false
+    c = MockModel.criteria.track_total_hits(false)
+    assert_equal false, c.to_query['track_total_hits']
+  end
+
+  def test_track_total_hits_integer
+    c = MockModel.criteria.track_total_hits(5000)
+    assert_equal 5000, c.to_query['track_total_hits']
+  end
+
+  def test_script_fields
+    c = MockModel.criteria.script_fields(
+      engagement: { script: { source: 'doc["likes"].value + doc["comments"].value' } }
+    )
+    sf = c.to_query['script_fields']
+    assert sf.key?('engagement')
+    assert sf.dig('engagement', 'script', 'source')
+  end
+
+  def test_sort_block
+    c = MockModel.criteria.sort { { 'published_at' => { 'order' => 'desc' } } }
+    assert_equal [{ 'published_at' => { 'order' => 'desc' } }], c.to_query['sort']
+  end
+
+  def test_sort_multiple_fields
+    c = MockModel.criteria
+                 .sort { { 'score' => 'desc' } }
+                 .sort { { 'published_at' => 'asc' } }
+    assert_equal 2, c.to_query['sort'].size
+  end
+
+  # ── Scope inside must / should / must_not ─────────────────────────────────
+
+  def test_scope_in_must_block
+    c = MockModel.must { active }
+    assert_equal({ 'term' => { 'status' => 'active' } },
+                 c.to_query.dig('query', 'bool', 'must'))
+  end
+
+  def test_scope_in_should_block
+    c = MockModel.should { active }
+                 .should { deleted }
+    should_clauses = c.to_query.dig('query', 'bool', 'should')
+    assert_includes should_clauses, { 'term' => { 'status' => 'active' } }
+    assert_includes should_clauses, { 'term' => { 'status' => 'deleted' } }
+  end
+
+  def test_scope_in_must_not_block
+    c = MockModel.must_not { deleted }
+    assert_equal({ 'term' => { 'status' => 'deleted' } },
+                 c.to_query.dig('query', 'bool', 'must_not'))
+  end
+
+  def test_scope_in_nested_bool_must
+    c = MockModel.filter do
+      bool do
+        must { active }
+        must { platform 'instagram' }
+      end
+    end
+    filters     = c.to_query.dig('query', 'bool', 'filter')
+    bool_clause = filters.find { |f| f['bool'] }
+    assert bool_clause
+    must = bool_clause.dig('bool', 'must')
+    assert_instance_of Array, must
+    assert_includes must, { 'term' => { 'status' => 'active' } }
+    assert_includes must, { 'term' => { 'platform' => 'instagram' } }
+  end
+
+  # ── Nested agg_scope (composite with scope sources) ───────────────────────
+
+  def test_agg_scope_composite_sources_via_scope
+    aggs = MockModel.aggregate(:by_combo) do |a|
+      a.composite do
+        size 5
+        sources do
+          by_platform_source
+          by_status_source
+        end
+      end
+    end.to_query['aggregations']
+    sources = aggs.dig('by_combo', 'composite', 'sources')
+    assert_equal 2, sources.size
+    assert sources.any? { |s| s.key?('platform') }
+    assert sources.any? { |s| s.key?('status_source') }
   end
 
   private

@@ -15,6 +15,7 @@ module Elasticsearch
 
       def initialize(model_qf_mod = nil)
         @clauses = []
+        @model_qf_mod = model_qf_mod
         extend(model_qf_mod) if model_qf_mod
       end
 
@@ -55,9 +56,15 @@ module Elasticsearch
         @clauses << { 'ids' => { 'values' => Array(values) } }
       end
 
-      # Accepts a raw hash for arbitrary bool structures.
-      def bool(raw = {})
-        @clauses << { 'bool' => deep_stringify(raw) }
+      # Accepts a block (creates BoolContext) or a raw hash for arbitrary bool structures.
+      def bool(raw = nil, &block)
+        if block_given?
+          bc = BoolContext.new(@model_qf_mod)
+          block.arity == 0 ? bc.instance_exec(&block) : block.call(bc)
+          @clauses << bc.to_h
+        else
+          @clauses << { 'bool' => deep_stringify(raw || {}) }
+        end
       end
 
       # Inject any raw clause hash directly.

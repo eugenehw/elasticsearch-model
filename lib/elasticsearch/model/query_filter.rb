@@ -28,9 +28,6 @@ module Elasticsearch
         end
       end
 
-      # Note: filter {} is handled by QueryContext#filter, not here, so that
-      # it always pushes to the per-compilation temp buffer (@_filter_buf).
-
       # Builds a bool/should that tries phrase match first, then falls back to fuzzy.
       def smart_match(field, value, opts = {})
         fuzziness    = opts.fetch(:fuzziness,    'AUTO')

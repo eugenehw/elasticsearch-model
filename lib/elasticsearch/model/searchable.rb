@@ -89,9 +89,75 @@ module Elasticsearch
           Criteria.new(self).filter(&block)
         end
 
+        def must(&block)
+          Criteria.new(self).must(&block)
+        end
+
+        def should(&block)
+          Criteria.new(self).should(&block)
+        end
+
+        def must_not(&block)
+          Criteria.new(self).must_not(&block)
+        end
+
         # Start building with an aggregation.
         def aggregate(name, raw_hash = nil, &block)
           Criteria.new(self).aggregate(name, raw_hash, &block)
+        end
+
+        # Stored agg_scope definitions accessible by AggBuilder method_missing.
+        def _agg_scopes
+          @_agg_scopes ||= {}
+        end
+
+        # Defines a named filter clause callable inside filter/bool/agg blocks.
+        # Adds method to the model's QueryFilter module (auto-created if absent).
+        def scope(name, &block)
+          qf_mod = if const_defined?(:QueryFilter, false)
+            const_get(:QueryFilter, false)
+          else
+            const_set(:QueryFilter, Module.new)
+          end
+          blk = block
+          qf_mod.define_method(name) { instance_exec(&blk) }
+        end
+
+        # Define a reusable named aggregate method.
+        #
+        # The definition block receives |agg, f| where:
+        #   agg = AggAccumulator — build aggregations
+        #   f   = FilterCollector — call scopes (e.g. f.active)
+        # Both args are optional. Inner blocks capture f via closure.
+        #
+        # Defines both a class method on the model and registers the scope
+        # so AggBuilder#method_missing can embed it as a sub-agg.
+        def agg_scope(name, &definition_block)
+          _agg_scopes[name.to_sym] = definition_block
+          model = self
+
+          define_singleton_method(name) do |&call_block|
+            accum = AggAccumulator.new(model)
+            f = accum.f
+            case definition_block.arity
+            when 0 then accum.instance_exec(&definition_block)
+            when 1 then definition_block.call(accum)
+            else        definition_block.call(accum, f)
+            end
+            if call_block
+              main_ab = accum.last_agg_builder
+              if main_ab
+                case call_block.arity
+                when 0 then main_ab.instance_exec(&call_block)
+                when 1 then call_block.call(main_ab)
+                else        call_block.call(main_ab, f)
+                end
+              end
+            end
+            c = Criteria.new(model)
+            accum.to_raw_aggs.each { |agg_name, raw| c.aggregate(agg_name, raw) }
+            c
+          end
         end
 
         # Start building with a sort clause. Two forms:

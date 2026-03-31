@@ -250,9 +250,10 @@ module Elasticsearch
 
     # ── BoolContext ──────────────────────────────────────────────────────────────
     # Evaluated inside bool {} blocks. Provides filter/must/should/must_not.
-    # Each sub-block runs in a ClauseContext that collects individual clauses.
+    # Each sub-block runs in a FilterCollector that collects individual clauses.
     class BoolContext
-      def initialize
+      def initialize(model_qf_mod = nil)
+        @model_qf_mod       = model_qf_mod
         @filter             = []
         @must               = []
         @should             = []
@@ -262,30 +263,38 @@ module Elasticsearch
       end
 
       def filter(&block)
-        cc = ClauseContext.new
-        cc.instance_exec(&block) if block_given?
-        @filter.concat(cc.clauses)
+        fc = FilterCollector.new(@model_qf_mod)
+        if block_given?
+          block.arity == 0 ? fc.instance_exec(&block) : block.call(fc)
+        end
+        @filter.concat(fc.clauses)
         self
       end
 
       def must(&block)
-        cc = ClauseContext.new
-        cc.instance_exec(&block) if block_given?
-        @must.concat(cc.clauses)
+        fc = FilterCollector.new(@model_qf_mod)
+        if block_given?
+          block.arity == 0 ? fc.instance_exec(&block) : block.call(fc)
+        end
+        @must.concat(fc.clauses)
         self
       end
 
       def should(&block)
-        cc = ClauseContext.new
-        cc.instance_exec(&block) if block_given?
-        @should.concat(cc.clauses)
+        fc = FilterCollector.new(@model_qf_mod)
+        if block_given?
+          block.arity == 0 ? fc.instance_exec(&block) : block.call(fc)
+        end
+        @should.concat(fc.clauses)
         self
       end
 
       def must_not(&block)
-        cc = ClauseContext.new
-        cc.instance_exec(&block) if block_given?
-        @must_not.concat(cc.clauses)
+        fc = FilterCollector.new(@model_qf_mod)
+        if block_given?
+          block.arity == 0 ? fc.instance_exec(&block) : block.call(fc)
+        end
+        @must_not.concat(fc.clauses)
         self
       end
 

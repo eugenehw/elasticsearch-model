@@ -23,6 +23,15 @@ module Elasticsearch
         post(path, body, timeout: timeout)
       end
 
+      def search_pit(body:, timeout: nil, params: {})
+        timeout ||= config.request_timeout
+        query_params = params.map { |k, v| "#{k}=#{v}" }.join('&')
+        path = '/_search'
+        path += "?#{query_params}" unless query_params.empty?
+
+        post(path, body, timeout: timeout)
+      end
+
       # POST /<index>/_pit?keep_alive=<keep_alive>
       def create_pit(index:, keep_alive:)
         post("/#{index}/_pit?keep_alive=#{keep_alive}", nil)

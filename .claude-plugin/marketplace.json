@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "elasticsearch-model",
+  "owner": {
+    "name": "eugene"
+  },
+  "metadata": {
+    "description": "Ruby ODM skill for building Elasticsearch queries with the elasticsearch-model gem"
+  },
+  "plugins": [
+    {
+      "version": "0.1.0",
+      "name": "elasticsearch-model",
+      "source": "./skills/elasticsearch-model",
+      "description": "Build Elasticsearch queries in Ruby using the elasticsearch-model ODM gem — filters, scopes, aggregations, agg_scopes, PIT pagination, and custom response classes",
+      "skills": "./"
+    }
+  ]
+}
