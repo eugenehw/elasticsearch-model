@@ -41,18 +41,6 @@ module Elasticsearch
           end
         end
 
-        # Declare model field metadata (used for documentation / future mapping support).
-        # No-op by default — override to add behaviour.
-        def field(name, type: nil, **_opts)
-          @_es_fields ||= {}
-          @_es_fields[name.to_sym] = { type: type }
-        end
-
-        # Returns declared field metadata hash.
-        def fields
-          @_es_fields || {}
-        end
-
         # Response class used by all searches on this model.
         # Defaults to MyModel::Response if defined, else ElasticsearchResponse.
         def response_class
@@ -120,7 +108,7 @@ module Elasticsearch
             const_set(:QueryFilter, Module.new)
           end
           blk = block
-          qf_mod.define_method(name) { instance_exec(&blk) }
+          qf_mod.define_method(name) { |*args| instance_exec(*args, &blk) }
         end
 
         # Define a reusable named aggregate method.
@@ -136,13 +124,14 @@ module Elasticsearch
           _agg_scopes[name.to_sym] = definition_block
           model = self
 
-          define_singleton_method(name) do |&call_block|
+          define_singleton_method(name) do |*args, **kwargs, &call_block|
             accum = AggAccumulator.new(model)
             f = accum.f
             case definition_block.arity
             when 0 then accum.instance_exec(&definition_block)
             when 1 then definition_block.call(accum)
-            else        definition_block.call(accum, f)
+            when 2 then definition_block.call(accum, f)
+            else        definition_block.call(accum, f, *args, **kwargs)
             end
             if call_block
               main_ab = accum.last_agg_builder

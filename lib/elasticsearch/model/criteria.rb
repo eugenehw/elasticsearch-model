@@ -414,7 +414,8 @@ module Elasticsearch
           case defn.arity
           when 0 then accum.instance_exec(&defn)
           when 1 then defn.call(accum)
-          else        defn.call(accum, f)
+          when 2 then defn.call(accum, f)
+          else        defn.call(accum, f, *args, **kwargs)
           end
           if block
             main_ab = accum.last_agg_builder

@@ -70,6 +70,28 @@ end
   - `filter { |f| f.active }` — via explicit QueryFilter arg
   - `filters(:active) { f.active }` — via closure from outer `|agg, f|`
 
+### Parameterized scope
+
+```ruby
+scope :by_platform do |platform|
+  term 'platform', platform
+end
+
+scope :followers_gte do |n|
+  range 'follower_count', gte: n
+end
+```
+
+Called with an argument:
+
+```ruby
+MockModel.filter { by_platform 'instagram' }
+MockModel.filter { |f| f.followers_gte(5000) }
+MockModel.filter { active; by_platform 'tiktok' }
+```
+
+Implementation: `qf_mod.define_method(name) { |*args| instance_exec(*args, &blk) }`
+
 ---
 
 ## `agg_scope` Macro
@@ -87,10 +109,11 @@ end
 
 | Arg | Type | Description |
 |---|---|---|
-| `agg` | `AggBuilder` | Build aggregations |
-| `f` | `QueryFilter` instance | Call scopes (e.g. `f.active`) |
+| `agg` | `AggBuilder` / `AggAccumulator` | Build aggregations |
+| `f` | `FilterCollector` (with QueryFilter) | Call scopes (e.g. `f.active`) |
+| `*args` | any | Extra args forwarded at call site |
 
-Both optional. Inner blocks capture `f` via closure — no need to re-pass.
+All args are optional. Inner blocks capture `f` via closure — no need to re-pass.
 
 ### Defines two things
 
@@ -115,6 +138,40 @@ MockModel.group_by_team.group_by_status.timeline
 ```
 
 `agg_scope` methods are available on `Criteria` (adds to `@raw_agg_hashes`).
+
+### Parameterized agg_scope
+
+Extra args (positional or keyword) after `agg, f` are forwarded at call site:
+
+```ruby
+agg_scope :by_field do |agg, f, field, size: 10|
+  agg.aggregate(:by_field) { terms field: field.to_s, size: size }
+end
+
+agg_scope :top_by_field do |agg, f, field|
+  agg.aggregate(:top)       { top_hits size: 3 }
+  agg.aggregate(:terms_agg) { terms field: field.to_s }
+end
+```
+
+Called as:
+
+```ruby
+MockModel.by_field('platform')           # default size: 10
+MockModel.by_field('team', size: 20)     # override keyword arg
+MockModel.top_by_field('status')         # positional arg
+```
+
+Block arity dispatch (applied in 5 locations across `searchable.rb`, `agg_builder.rb`, `criteria.rb`):
+
+```ruby
+case defn.arity
+when 0 then accum.instance_exec(&defn)
+when 1 then defn.call(accum)
+when 2 then defn.call(accum, f)
+else        defn.call(accum, f, *args)
+end
+```
 
 ---
 
@@ -225,9 +282,11 @@ end
 def scope(name, &block)
   qf = const_defined?(:QueryFilter, false) ? const_get(:QueryFilter) : const_set(:QueryFilter, Module.new)
   blk = block
-  qf.define_method(name) { instance_exec(&blk) }
+  qf.define_method(name) { |*args| instance_exec(*args, &blk) }
 end
 ```
+
+Supports parameterized scopes: `scope :by_platform do |p| term 'platform', p end`
 
 ### `agg_scope` implementation
 

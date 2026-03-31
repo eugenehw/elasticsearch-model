@@ -11,10 +11,6 @@ class MockModel
   include Elasticsearch::Model::Searchable
   index_name 'mock_index'
 
-  field :platform,   type: String
-  field :created_at, type: DateTime
-  field :status,     type: String
-
   def self.search_index(criteria = nil)
     range = criteria&.date_filter_for(:published_at)
     if range
@@ -31,6 +27,14 @@ class MockModel
 
   scope :deleted do
     term 'status', 'deleted'
+  end
+
+  scope :by_platform do |platform|
+    term 'platform', platform
+  end
+
+  scope :followers_gte do |n|
+    range 'follower_count', gte: n
   end
 
   # Model-specific QueryFilter helpers — available in both query {} and filter {} blocks
@@ -72,6 +76,15 @@ class MockModel
 
   agg_scope :by_status_source do |a|
     a.aggregate(:status_source) { terms field: 'status' }
+  end
+
+  agg_scope :by_field do |agg, f, field, size: 10|
+    agg.aggregate(:by_field) { terms field: field.to_s, size: size }
+  end
+
+  agg_scope :top_by_field do |agg, f, field|
+    agg.aggregate(:top) { top_hits size: 3 }
+    agg.aggregate(:terms_agg) { terms field: field.to_s }
   end
 
   # Custom response class
@@ -772,6 +785,69 @@ class CriteriaTest < Minitest::Test
     assert_instance_of Array, must
     assert_includes must, { 'term' => { 'status' => 'active' } }
     assert_includes must, { 'term' => { 'platform' => 'instagram' } }
+  end
+
+  # ── Parameterized scope ───────────────────────────────────────────────────
+
+  def test_parameterized_scope_in_filter_block
+    c = MockModel.filter { by_platform 'instagram' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'term' => { 'platform' => 'instagram' } }
+  end
+
+  def test_parameterized_scope_with_explicit_f
+    c = MockModel.filter { |f| f.by_platform('tiktok') }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'term' => { 'platform' => 'tiktok' } }
+  end
+
+  def test_parameterized_scope_range
+    c = MockModel.filter { followers_gte 5000 }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    range = filters.find { |f| f['range'] }
+    assert range
+    assert_equal 5000, range.dig('range', 'follower_count', 'gte')
+  end
+
+  def test_parameterized_scope_chained_with_non_param_scope
+    c = MockModel.filter { active }.filter { by_platform 'youtube' }
+    filters = c.to_query.dig('query', 'bool', 'filter')
+    assert_includes filters, { 'term' => { 'status' => 'active' } }
+    assert_includes filters, { 'term' => { 'platform' => 'youtube' } }
+  end
+
+  # ── Parameterized agg_scope ──────────────────────────────────────────────
+
+  def test_parameterized_agg_scope_basic
+    aggs = MockModel.by_field('platform').to_query['aggregations']
+    assert aggs.key?('by_field')
+    assert_equal({ 'field' => 'platform', 'size' => 10 }, aggs.dig('by_field', 'terms'))
+  end
+
+  def test_parameterized_agg_scope_keyword_arg_override
+    aggs = MockModel.by_field('team', size: 20).to_query['aggregations']
+    assert_equal({ 'field' => 'team', 'size' => 20 }, aggs.dig('by_field', 'terms'))
+  end
+
+  def test_parameterized_agg_scope_multiple_aggs
+    aggs = MockModel.top_by_field('platform').to_query['aggregations']
+    assert aggs.key?('top')
+    assert aggs.key?('terms_agg')
+    assert_equal({ 'field' => 'platform' }, aggs.dig('terms_agg', 'terms'))
+  end
+
+  def test_parameterized_agg_scope_chained_with_other_agg_scopes
+    aggs = MockModel.by_field('status').group_by_team.to_query['aggregations']
+    assert aggs.key?('by_field')
+    assert aggs.key?('teams')
+  end
+
+  def test_parameterized_agg_scope_with_call_time_sub_agg
+    aggs = MockModel.by_field('platform') do |ab|
+      ab.aggregate(:reach) { sum field: 'reach' }
+    end.to_query['aggregations']
+    assert_equal({ 'field' => 'platform', 'size' => 10 }, aggs.dig('by_field', 'terms'))
+    assert_equal({ 'field' => 'reach' }, aggs.dig('by_field', 'aggs', 'reach', 'sum'))
   end
 
   # ── Nested agg_scope (composite with scope sources) ───────────────────────

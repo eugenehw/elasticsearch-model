@@ -34,15 +34,25 @@ end
 
 ## `scope` — named filter helper
 
-Defines a named method usable inside any `filter {}` or `bool {}` block.
+Defines a named method usable inside any `filter {}`, `must {}`, `should {}`, or `bool {}` block.
 
 ```ruby
-scope :active   do; term :status, 'active'; end
-scope :deleted  do; term :status, 'deleted'; end
+# No-arg scopes
+scope :active    do; term :status, 'active';   end
+scope :deleted   do; term :status, 'deleted';  end
 scope :instagram do; term :platform, 'instagram'; end
 
 scope :high_engagement do
   range :engagement, gte: 10_000
+end
+
+# Parameterized scopes
+scope :by_platform do |platform|
+  term 'platform', platform
+end
+
+scope :followers_gte do |n|
+  range 'follower_count', gte: n
 end
 ```
 
@@ -50,9 +60,56 @@ Scopes are called either via `instance_exec` (0-arity block) or via an explicit
 `QueryFilter` arg (block with `|f|`):
 
 ```ruby
-# Both are equivalent:
+# No-arg scope — both are equivalent:
 MyModel.filter { active }
 MyModel.filter { |f| f.active }
+
+# Parameterized scope:
+MyModel.filter { by_platform 'instagram' }
+MyModel.filter { |f| f.by_platform('instagram') }
+MyModel.filter { followers_gte 10_000 }
+
+# Combining:
+MyModel.filter { active; by_platform 'tiktok' }
+```
+
+---
+
+## `query {}` — scoring query block
+
+Used for full-text search and scoring clauses. Multiple `query {}` calls merge into `bool.must`.
+
+```ruby
+# match_all (default when no query given)
+MyModel.criteria.to_h
+
+# full-text
+MyModel.query { match :name, 'john' }.to_h
+MyModel.query { match_phrase :bio, 'content creator' }.to_h
+MyModel.query { multi_match('john', fields: %w[name bio]) }.to_h
+MyModel.query { query_string('john AND smith') }.to_h
+
+# smart_match — bool/should with match_phrase + match (scoring boost)
+MyModel.query { smart_match :name, 'john' }.to_h
+
+# date_range — pushes to filter context (non-scoring)
+MyModel.query { date_range :published_at, from: '2025-01-01', to: '2025-12-31' }.to_h
+
+# filter_terms — pushes to filter context
+MyModel.query { filter_terms :platform, %w[instagram tiktok] }.to_h
+
+# nested
+MyModel.query { nested('tags') { term 'tags.name', 'ruby' } }.to_h
+
+# knn
+MyModel.query { knn('embedding', query_vector: [1.0, 0.5], k: 5, num_candidates: 100) }.to_h
+
+# chaining — merged into bool/must
+MyModel
+  .query { smart_match :name, 'john' }
+  .query { date_range :published_at, from: '2025-01-01' }
+  .filter { active }
+  .to_h
 ```
 
 ---
@@ -70,6 +127,9 @@ MyModel.filter { term :status, 'active' }.to_h
 # Using a scope
 MyModel.filter { active }.to_h
 
+# Parameterized scope
+MyModel.filter { by_platform 'instagram' }.to_h
+
 # Multiple clauses (ANDed as bool/filter)
 MyModel.filter do
   active
@@ -80,8 +140,22 @@ end.to_h
 # Explicit QueryFilter arg — same result
 MyModel.filter do |f|
   f.active
+  f.by_platform 'instagram'
   f.term :team, 'team-1'
 end.to_h
+```
+
+### Top-level `must` / `should` / `must_not`
+
+Same block style as `filter` but maps to `bool.must` / `bool.should` / `bool.must_not`:
+
+```ruby
+MyModel.must    { term :status, 'active' }.to_h
+MyModel.must_not { term :status, 'deleted' }.to_h
+MyModel
+  .should { term :platform, 'instagram' }
+  .should { term :platform, 'tiktok' }
+  .to_h
 ```
 
 ### `bool` inside filter
@@ -109,6 +183,67 @@ end.to_h
 
 ---
 
+## New-style `bool` API
+
+An alternative to `filter {}` blocks — attach directly to a Criteria object:
+
+```ruby
+q = MyModel.criteria
+q.bool.filter  { |f| f.term('status', 'active') }
+q.bool.must    { |f| f.match('name', 'john') }
+q.bool.should  { |f| f.term('platform', 'instagram') }
+q.bool.should  { |f| f.term('platform', 'tiktok') }
+q.bool.minimum_should_match(1)
+q.to_h
+```
+
+Without a block, `q.bool.filter` returns the accumulated clauses array (for introspection).
+
+---
+
+## Criteria top-level parameters
+
+```ruby
+MyModel.criteria
+  .from(0)
+  .size(20)
+  .source('name', 'platform')         # _source filtering
+  .track_total_hits(true)             # true / false / integer threshold
+  .script_fields(
+    engagement: { script: { source: 'doc["likes"].value + doc["comments"].value' } }
+  )
+  .sort { { published_at: { order: 'desc' } } }
+  .to_h
+```
+
+`track_total_hits` values:
+- `true` — exact count always
+- `false` — skip counting
+- `10_000` — count up to N; returns `"relation": "gte"` if exceeded
+
+---
+
+## `date_filter_for` — introspect date range
+
+Used by `search_index` overrides to inspect the compiled query's date filters:
+
+```ruby
+def self.search_index(criteria = nil)
+  range = criteria&.date_filter_for(:published_at)
+  # range => { "gte" => "2025-01-01", "lte" => "2025-12-31" } or nil
+  return index_name unless range
+
+  year = Date.parse(range['gte'] || range['lte']).year
+  "content_#{year}"
+rescue ArgumentError, TypeError
+  index_name
+end
+```
+
+Scans both `query.bool.filter` and `query.bool.must` for range clauses on the given field.
+
+---
+
 ## `aggregate` — inline aggregation
 
 ```ruby
@@ -130,10 +265,44 @@ MyModel.aggregate(:status) do |agg|
   agg.filters(:deleted) { term :status, 'deleted' }
 end.to_h
 
-# with QueryFilter arg (f captured by closure in inner blocks)
+# with QueryFilter arg (f captured by closure in inner blocks, supports scopes)
 MyModel.aggregate(:status) do |agg, f|
   agg.filters(:active)  { f.active }
   agg.filters(:deleted) { f.deleted }
+end.to_h
+
+# composite agg — inline sources
+MyModel.aggregate(:by_combo) do |a|
+  a.composite do
+    size 20
+    sources do
+      aggregate(:platform) { terms field: 'platform' }
+      aggregate(:paid)     { terms field: 'paid' }
+    end
+  end
+end.to_h
+
+# composite agg — sources from agg_scopes (see agg_scope section)
+MyModel.aggregate(:by_combo) do |a|
+  a.composite do
+    size 10
+    sources do
+      by_platform_source  # resolved from agg_scope
+      by_status_source
+    end
+  end
+end.to_h
+
+# pipeline agg
+MyModel.aggregate(:total_sales) do |a|
+  a.sum_bucket(buckets_path: 'by_month>sales')
+end.to_h
+
+MyModel.aggregate(:rate) do |a|
+  a.bucket_script(
+    buckets_path: { eng: 'engagement>value', fol: 'followers>value' },
+    script: 'params.eng / params.fol'
+  )
 end.to_h
 ```
 
@@ -146,6 +315,14 @@ Defines a named aggregation that becomes:
 2. A method on `AggBuilder` for embedding as a sub-agg: `teams_agg.group_by_status`
 
 ```ruby
+# No-arg (agg only)
+agg_scope :group_by_team do |agg|
+  agg.aggregate(:teams) do
+    terms field: :team, size: 10
+  end
+end
+
+# With filter context (f carries scopes)
 agg_scope :group_by_status do |agg, f|
   agg.aggregate(:status) do |status_agg|
     status_agg.filters(:active)  { f.active }
@@ -153,10 +330,9 @@ agg_scope :group_by_status do |agg, f|
   end
 end
 
-agg_scope :group_by_team do |agg|
-  agg.aggregate(:teams) do
-    terms field: :team, size: 10
-  end
+# Parameterized — extra args after agg, f
+agg_scope :by_field do |agg, f, field, size: 10|
+  agg.aggregate(:by_field) { terms field: field.to_s, size: size }
 end
 
 agg_scope :timeline do |agg|
@@ -173,12 +349,21 @@ end
 MyModel.group_by_status.to_h
 MyModel.timeline.to_h
 
+# Parameterized
+MyModel.by_field('platform').to_h
+MyModel.by_field('team', size: 20).to_h
+
 # Chained as siblings (all aggs merged at top level)
 MyModel.group_by_team.group_by_status.timeline.to_h
 
-# With extra sub-aggs added at call site
-MyModel.group_by_status do |agg, f|
+# With call-site sub-agg block
+MyModel.group_by_status do |agg|
   agg.aggregate(:reach) { sum field: :reach }
+end.to_h
+
+# Parameterized + call-site sub-agg
+MyModel.by_field('platform') do |ab|
+  ab.aggregate(:reach) { sum field: 'reach' }
 end.to_h
 ```
 

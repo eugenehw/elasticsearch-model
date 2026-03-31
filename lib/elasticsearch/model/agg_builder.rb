@@ -159,7 +159,8 @@ module Elasticsearch
             case defn.arity
             when 0 then accum.instance_exec(&defn)
             when 1 then defn.call(accum)
-            else        defn.call(accum, f)
+            when 2 then defn.call(accum, f)
+            else        defn.call(accum, f, *args, **opts)
             end
             main_ab = accum.last_agg_builder
             if call_block && main_ab
@@ -255,7 +256,7 @@ module Elasticsearch
         @aggs.transform_values(&:build)
       end
 
-      def method_missing(name, *args, &call_block)
+      def method_missing(name, *args, **kwargs, &call_block)
         scopes = @model_class.respond_to?(:_agg_scopes) ? @model_class._agg_scopes : {}
         defn = scopes[name.to_sym]
         return super unless defn
@@ -264,7 +265,8 @@ module Elasticsearch
         case defn.arity
         when 0 then instance_exec(&defn)
         when 1 then defn.call(self)
-        else        defn.call(self, @f)
+        when 2 then defn.call(self, @f)
+        else        defn.call(self, @f, *args, **kwargs)
         end
 
         new_abs = @aggs.select { |k, _| !pre_keys.include?(k) }.values
@@ -363,7 +365,8 @@ module Elasticsearch
             case defn.arity
             when 0 then accum.instance_exec(&defn)
             when 1 then defn.call(accum)
-            else        defn.call(accum, accum.f)
+            when 2 then defn.call(accum, accum.f)
+            else        defn.call(accum, accum.f, *args)
             end
             accum.to_raw_aggs.each { |n, raw| @sources << { n => raw } }
             return self
