@@ -31,6 +31,7 @@ module Elasticsearch
         @should_clauses   = []   # → query.bool.should (from new API)
         @must_not_clauses = []   # → query.bool.must_not (from new API)
         @minimum_should_match = nil
+        @knn_builder      = nil  # → top-level knn (alongside query)
         @sort_blocks      = []
         @agg_blocks       = {}
         @raw_agg_hashes   = {}
@@ -59,14 +60,37 @@ module Elasticsearch
         @bool_builder ||= BoolBuilder.new(self)
       end
 
+      # Top-level knn clause (coexists with query for hybrid search).
+      # The block is evaluated on a KnnBuilder — call filter {} inside to add
+      # filter clauses (scopes are available there too).
+      #
+      #   Model.knn(:image_embedding, query_vector: vec, k: 10, num_candidates: 15) do
+      #     filter { term 'platform', 'instagram' }
+      #     filter { by_platform 'instagram' }
+      #     similarity 0.8
+      #   end.query { smart_match :caption, 'sunset' }.search
+      def knn(field, query_vector:, k:, num_candidates:, **opts, &block)
+        reset_compiled!
+        @knn_builder = KnnBuilder.new(
+          field,
+          query_vector:   query_vector,
+          k:              k,
+          num_candidates: num_candidates,
+          model_qf_mod:   model_filter_module,
+          **opts
+        )
+        block.arity.zero? ? @knn_builder.instance_exec(&block) : block.call(@knn_builder) if block
+        self
+      end
+
       # Accumulate filter clauses from a block (top-level Criteria API).
       # Each method call in the block adds one entry to query.bool.filter.
       def filter(&block)
         reset_compiled!
         if block_given?
-          collector = build_filter_collector
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @filter_clauses.concat(collector.clauses)
+          ctx = FilterContext.new(model_filter_module)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @filter_clauses.concat(ctx.clauses)
         end
         self
       end
@@ -74,9 +98,9 @@ module Elasticsearch
       def must(&block)
         reset_compiled!
         if block_given?
-          collector = build_filter_collector
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @must_clauses.concat(collector.clauses)
+          ctx = MustContext.new(model_filter_module)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @must_clauses.concat(ctx.clauses)
         end
         self
       end
@@ -84,9 +108,9 @@ module Elasticsearch
       def should(&block)
         reset_compiled!
         if block_given?
-          collector = build_filter_collector
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @should_clauses.concat(collector.clauses)
+          ctx = ShouldContext.new(model_filter_module)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @should_clauses.concat(ctx.clauses)
         end
         self
       end
@@ -94,9 +118,9 @@ module Elasticsearch
       def must_not(&block)
         reset_compiled!
         if block_given?
-          collector = build_filter_collector
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @must_not_clauses.concat(collector.clauses)
+          ctx = MustNotContext.new(model_filter_module)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @must_not_clauses.concat(ctx.clauses)
         end
         self
       end
@@ -337,7 +361,7 @@ module Elasticsearch
           when 1
             blk.call(ab)
           else
-            f = FilterCollector.new(model_filter_module)
+            f = FilterContext.new(model_filter_module)
             ab.f_ref = f
             blk.call(ab, f)
           end
@@ -360,6 +384,11 @@ module Elasticsearch
         h['_source']            = @source_fields           if @source_fields
         h['track_total_hits']   = @track_total_hits        unless @track_total_hits.nil?
         h['script_fields']      = @script_fields           if @script_fields
+
+        if @knn_builder
+          h['knn']        = @knn_builder.to_h
+          h['min_score']  = @knn_builder.min_score if @knn_builder.min_score
+        end
 
         h
       end
@@ -450,10 +479,6 @@ module Elasticsearch
         (@model_class.respond_to?(:_agg_scopes) && @model_class._agg_scopes.key?(name.to_sym)) ||
           (model_filter_module&.method_defined?(name)) ||
           super
-      end
-
-      def build_filter_collector
-        FilterCollector.new(model_filter_module)
       end
 
       def model_filter_module

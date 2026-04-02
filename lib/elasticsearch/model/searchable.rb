@@ -89,6 +89,12 @@ module Elasticsearch
           Criteria.new(self).must_not(&block)
         end
 
+        # Start building with a top-level knn clause.
+        def knn(field, query_vector:, k:, num_candidates:, **opts, &block)
+          Criteria.new(self).knn(field, query_vector: query_vector, k: k,
+                                        num_candidates: num_candidates, **opts, &block)
+        end
+
         # Start building with an aggregation.
         def aggregate(name, raw_hash = nil, &block)
           Criteria.new(self).aggregate(name, raw_hash, &block)

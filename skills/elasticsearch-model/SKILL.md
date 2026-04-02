@@ -11,8 +11,7 @@ metadata:
 
 # elasticsearch-model Ruby ODM
 
-Lightweight ODM (Object-Document Mapper) for Elasticsearch. Pure Ruby, no
-`elasticsearch-dsl` dependency. Ruby 2.6 compatible.
+Lightweight ODM (Object-Document Mapper) for Elasticsearch. Pure Ruby.
 
 ## When to use this skill
 
@@ -116,9 +115,9 @@ MyModel
 
 ## `filter {}` — building filter clauses
 
-All ES clause methods are available inside the block: `term`, `terms`, `range`,
-`exists`, `bool`, `must_not`, `raw`, etc. Symbol field names are stringified
-automatically.
+Available clauses: `term`, `terms`, `range`, `exists`, `bool`, `nested`, geo, `script`, `raw`, scopes.
+**Scoring clauses (`match`, `knn`, etc.) are not available here** — calling them raises `NoMethodError`.
+Use `must {}` / `query {}` for scoring clauses.
 
 ```ruby
 # Simple term filter
@@ -179,6 +178,80 @@ MyModel.filter do
   raw(bool: { should: [{term: {status: 'active'}}, {term: {status: 'deleted'}}],
               minimum_should_match: 1 })
 end.to_h
+```
+
+### Injecting pre-built clause arrays into `BoolContext`
+
+`bool { filter/must/should/must_not }` also accept a plain Array instead of a block.
+Use this to forward accumulated clauses from another `Criteria`:
+
+```ruby
+c = MyModel
+  .filter { active }
+  .filter { term 'platform', 'instagram' }
+  .should { term 'type', 'video' }
+
+MyModel.knn(:image_embedding, query_vector: vec, k: k, num_candidates: n) do
+  filter do
+    bool do
+      filter   c.filter_clauses    # Array — no block needed
+      should   c.should_clauses
+      minimum_should_match 1
+    end
+  end
+end.search
+```
+
+---
+
+## `knn` — vector search
+
+### Top-level knn (alongside `query` for hybrid search)
+
+```ruby
+MyModel.knn(:image_embedding, query_vector: vec, k: 10, num_candidates: 15) do
+  filter { term 'platform', 'instagram' }
+  filter { active }          # scope
+  similarity 0.8
+  min_score 0.5
+end.query { smart_match :caption, 'sunset' }
+  .search
+```
+
+- Multiple `filter {}` calls accumulate; >1 clause is wrapped as `{ bool: { filter: [...] } }`.
+- `min_score` is emitted at the top-level body, not inside the `knn` clause.
+- `match` inside `filter {}` raises `NoMethodError`.
+
+### Inline knn inside `query {}`
+
+```ruby
+MyModel.query do
+  knn(:image_embedding, query_vector: vec, k: 10, num_candidates: 15) do
+    filter { active }
+  end
+  match :caption, 'sunset'
+end.to_h
+```
+
+### query vs knn routing pattern
+
+```ruby
+criteria = base_criteria  # already has filter/should/must clauses
+
+if query_vector.present?
+  MyModel.knn(:image_embedding, query_vector: query_vector,
+              k: k, num_candidates: (k * 1.5).ceil) do
+    filter do
+      bool do
+        filter   criteria.filter_clauses
+        should   criteria.should_clauses
+        minimum_should_match criteria.should_clauses.any? ? 1 : nil
+      end
+    end
+  end.search
+else
+  criteria.search
+end
 ```
 
 ---

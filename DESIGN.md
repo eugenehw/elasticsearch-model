@@ -7,18 +7,23 @@
 
 ## Architecture Overview
 
-Lightweight ODM for Elasticsearch. Pure Ruby, no elasticsearch-dsl dependency.
+Lightweight ODM for Elasticsearch. Pure Ruby.
 Entry point: `include Elasticsearch::Model::Searchable`.
 
 ### Core Classes
 
-| Class | Role |
+| Class / Module | Role |
 |---|---|
 | `Criteria` | Lazy query builder. Accumulates state, compiles to Hash on `to_h`. |
 | `AggBuilder` | DSL for building one aggregation node (type + opts + sub-aggs). |
-| `FilterCollector` | Accumulates filter clauses inside `filter {}` blocks. |
-| `QueryContext` | `instance_exec` context for `query {}` blocks; includes QueryFilter. |
+| `FilterClauses` | Module: term/terms/range/exists/bool/nested/geo/script/raw — filter-valid only. |
+| `QueryClauses` | Module: match/match_phrase/knn/dis_max/… — scoring query clauses. |
+| `FilterContext` | includes `FilterClauses` only. Used in `filter {}` blocks. `match` → `NoMethodError`. |
+| `MustContext` | `FilterContext` + `QueryClauses`. Used in `must {}` / `should {}` / `must_not {}`. |
+| `BoolContext` | Builds nested bool; routes sub-blocks to `FilterContext` or `MustContext`. |
+| `QueryContext` | `MustContext` + QueryFilter helpers. Used in `query {}` blocks. |
 | `BoolBuilder` | Attached to Criteria; exposes `.filter {}`, `.must {}`, `.should {}`. |
+| `KnnBuilder` | Builds `knn` clause; `filter {}` uses `FilterContext` (scopes supported). |
 
 ---
 
@@ -328,7 +333,6 @@ and `minimum_should_match N` are available.
 ## Constraints
 
 - Ruby 2.6 compatible — no endless methods, no `...` forwarding
-- No elasticsearch-dsl dependency
 - Tests: minitest 5.18.1
 - `rescue` modifier form disallowed (Rubocop)
 - `Date` requires explicit `require 'date'`
@@ -336,9 +340,31 @@ and `minimum_should_match N` are available.
 
 ---
 
-## FilterCollector Clause Reference
+## Context Hierarchy
 
-Available inside `filter {}`, `must {}`, `should {}`, `must_not {}`, `filters(:name) {}`, and `bool {}` sub-blocks.
+```
+FilterContext   (FilterClauses only)
+  └─ MustContext = ShouldContext = MustNotContext   (+ QueryClauses)
+       └─ QueryContext   (+ QueryFilter helpers)
+```
+
+Calling a scoring clause (`match`, `knn`, …) inside `FilterContext` raises `NoMethodError`
+at Ruby level — caught before the query is sent to ES.
+
+`BoolContext` routes each sub-block to the appropriate context:
+
+| Method | Context used |
+|---|---|
+| `filter {}` | `FilterContext` |
+| `must {}` | `MustContext` |
+| `should {}` | `ShouldContext` |
+| `must_not {}` | `MustNotContext` |
+
+---
+
+## FilterContext Clause Reference
+
+Available inside `filter {}`, `filters(:name) {}`, and `bool.filter {}` blocks.
 
 ### Term-level
 
@@ -350,13 +376,6 @@ exists 'published_at'
 ids [1, 2, 3]
 prefix  'name', 'joh'
 wildcard 'name', 'jo*'
-```
-
-### Full-text
-
-```ruby
-match        'bio', 'content creator'
-match_phrase 'bio', 'content creator'
 ```
 
 ### Compound
@@ -372,6 +391,25 @@ end
 bool({ must_not: { exists: { field: 'deleted_at' } } })  # raw hash form
 ```
 
+### Injecting pre-built clause arrays
+
+`BoolContext#filter`, `#must`, `#should`, `#must_not` also accept a plain Array
+of clauses directly (no block). Useful to forward clauses from another `Criteria`:
+
+```ruby
+c = MockModel.filter { active }.filter { term 'platform', 'instagram' }
+
+MockModel.knn(:image_embedding, query_vector: vec, k: k, num_candidates: n) do
+  filter do
+    bool do
+      filter   c.filter_clauses    # array form
+      should   c.should_clauses
+      must_not c.must_not_clauses
+    end
+  end
+end
+```
+
 ### Escape hatch
 
 ```ruby
@@ -380,29 +418,101 @@ raw({ 'script' => { 'script' => { 'source' => '...' } } })
 
 ---
 
-## Query Context Clause Reference
+## MustContext / ShouldContext / MustNotContext Clause Reference
 
-Available inside `query {}` blocks. Inherits all FilterCollector clauses plus:
+Inherits all `FilterContext` clauses plus:
 
 ```ruby
-# Full-text
+match        'bio', 'content creator'
+match_phrase 'bio', 'content creator'
+match_phrase_prefix 'name', 'joh'
+match_all
 multi_match 'john', fields: %w[name bio], type: 'best_fields'
 query_string 'john AND (smith OR doe)'
 simple_query_string 'john smith'
-match_phrase_prefix 'name', 'joh'
-
-# Compound
-nested('tags') { term 'tags.name', 'ruby' }
+knn 'embedding', query_vector: [1.0, 0.5], k: 5, num_candidates: 100
+more_like_this fields: %w[name bio], like: 'john'
 dis_max({ match: { name: 'john' } }, { match: { bio: 'john' } }, tie_breaker: 0.3)
 constant_score(boost: 1.5) { term 'status', 'active' }
+boosting positive: { term: { status: 'active' } },
+         negative: { term: { status: 'deleted' } }, negative_boost: 0.5
+```
 
-# Vector / specialised
-knn 'embedding', query_vector: [1.0, 0.5], k: 5, num_candidates: 100
+Any unknown ES keyword falls through `method_missing` to `add_clause`.
 
+---
+
+## Query Context Clause Reference
+
+Available inside `query {}` blocks. Inherits `MustContext` plus QueryFilter helpers:
+
+```ruby
 # DSL helpers (QueryFilter)
 smart_match    :name, 'john'                        # bool/should: phrase + fuzzy
 date_range     :published_at, from: '2025-01-01', to: '2025-12-31'
 filter_terms   :platform, %w[instagram tiktok]     # non-scoring filter
+```
+
+---
+
+## KnnBuilder
+
+`KnnBuilder` is the block context for `Model.knn(...)` and inline `knn(...)` inside `query {}`.
+
+### Block DSL
+
+```ruby
+filter {}          # FilterContext block — scopes available, match → NoMethodError
+similarity(float)  # similarity threshold
+min_score(float)   # top-level min_score (top-level knn only, not written inside knn body)
+boost(float)
+```
+
+### Top-level knn — coexists with query (hybrid search)
+
+```ruby
+Model.knn(:image_embedding, query_vector: vec, k: 10, num_candidates: 15) do
+  filter { active }
+  filter { term 'platform', 'instagram' }
+  similarity 0.8
+  min_score 0.5
+end.query { match :caption, 'sunset' }.search
+```
+
+Compiles to `{ knn: {...}, query: {...}, min_score: 0.5 }`.
+Multiple `filter {}` calls accumulate; if >1, wrapped in `{ bool: { filter: [...] } }`.
+
+### Inline knn inside query {}
+
+```ruby
+Model.query do
+  knn(:image_embedding, query_vector: vec, k: 10, num_candidates: 15) do
+    filter { term 'platform', 'instagram' }
+  end
+  match :caption, 'sunset'
+end
+```
+
+Compiles to `{ query: { bool: { must: [{ knn: {...} }, { match: {...} }] } } }`.
+
+### Forwarding clauses from another Criteria
+
+Pre-built `filter_clauses` / `should_clauses` / `must_clauses` / `must_not_clauses`
+from a `Criteria` object can be injected directly via `BoolContext` array form:
+
+```ruby
+c = Model.filter { active }.filter { term 'platform', 'instagram' }
+        .should { term 'type', 'video' }
+
+Model.knn(:image_embedding, query_vector: vec, k: k, num_candidates: n) do
+  filter do
+    bool do
+      filter   c.filter_clauses
+      should   c.should_clauses
+      minimum_should_match 1
+    end
+  end
+end.search
 ```
 
 ---

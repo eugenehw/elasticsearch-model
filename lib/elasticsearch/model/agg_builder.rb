@@ -65,7 +65,7 @@ module Elasticsearch
 
       # ES `filter` aggregation — takes a filter block.
       def filter(&block)
-        collector = FilterCollector.new(model_qf_mod)
+        collector = FilterContext.new(model_qf_mod)
         if block_given?
           block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
         end
@@ -92,7 +92,7 @@ module Elasticsearch
           set_agg('filters', { 'filters' => fb.to_h })
         else
           @filters_buckets ||= {}
-          collector = FilterCollector.new(model_qf_mod)
+          collector = FilterContext.new(model_qf_mod)
           if block_given?
             if block.arity == 0
               # Track @f_ref clauses before/after: { f.active } pattern adds to @f_ref
@@ -293,7 +293,7 @@ module Elasticsearch
 
       def build_f
         qf_mod = @model_class.const_defined?(:QueryFilter, false) ? @model_class::QueryFilter : nil
-        FilterCollector.new(qf_mod)
+        FilterContext.new(qf_mod)
       end
     end
 
@@ -390,7 +390,7 @@ module Elasticsearch
       end
 
       def filter(name, &block)
-        collector = FilterCollector.new(@model_qf_mod)
+        collector = FilterContext.new(@model_qf_mod)
         if block_given?
           block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
         end

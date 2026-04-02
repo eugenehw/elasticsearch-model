@@ -1,6 +1,6 @@
 # elasticsearch-model
 
-Lightweight Elasticsearch ODM (Object-Document Mapper) — pure Ruby, no elasticsearch-dsl dependency.
+Lightweight Elasticsearch ODM (Object-Document Mapper) — pure Ruby.
 
 ## Requirements
 

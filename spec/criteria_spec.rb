@@ -481,16 +481,14 @@ class CriteriaTest < Minitest::Test
     assert_includes filters, { 'terms' => { 'platform' => %w[instagram tiktok] } }
   end
 
-  def test_filter_match_clause
-    c = MockModel.filter { match 'name', 'john' }
-    filters = c.to_query.dig('query', 'bool', 'filter')
-    assert_includes filters, { 'match' => { 'name' => 'john' } }
+  def test_filter_match_clause_raises
+    # match is a scoring query clause and must not be used in filter context
+    assert_raises(NoMethodError) { MockModel.filter { match 'name', 'john' } }
   end
 
-  def test_filter_match_phrase_clause
-    c = MockModel.filter { match_phrase 'bio', 'content creator' }
-    filters = c.to_query.dig('query', 'bool', 'filter')
-    assert_includes filters, { 'match_phrase' => { 'bio' => 'content creator' } }
+  def test_filter_match_phrase_clause_raises
+    # match_phrase is a scoring query clause and must not be used in filter context
+    assert_raises(NoMethodError) { MockModel.filter { match_phrase 'bio', 'content creator' } }
   end
 
   def test_filter_prefix_clause
@@ -709,6 +707,149 @@ class CriteriaTest < Minitest::Test
     assert_equal 2, sources.size
     assert_equal({ 'terms' => { 'field' => 'platform' } }, sources[0]['platform'])
     assert_equal({ 'terms' => { 'field' => 'status' } },   sources[1]['status_source'])
+  end
+
+  # ── KnnBuilder ────────────────────────────────────────────────────────────
+
+  VEC = Array.new(4, 0.1)
+
+  def test_knn_top_level_basic
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10)
+    knn = c.to_query['knn']
+    assert_equal 'image_embedding', knn['field']
+    assert_equal VEC,               knn['query_vector']
+    assert_equal 5,                 knn['k']
+    assert_equal 10,                knn['num_candidates']
+  end
+
+  def test_knn_top_level_with_filter_block
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter { term 'platform', 'instagram' }
+    end
+    filter = c.to_query.dig('knn', 'filter')
+    assert_equal({ 'term' => { 'platform' => 'instagram' } }, filter)
+  end
+
+  def test_knn_top_level_with_scope_in_filter
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter { active }
+    end
+    filter = c.to_query.dig('knn', 'filter')
+    assert_equal({ 'term' => { 'status' => 'active' } }, filter)
+  end
+
+  def test_knn_top_level_multiple_filters_wrapped_in_bool
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter { term 'platform', 'instagram' }
+      filter { active }
+    end
+    filter = c.to_query.dig('knn', 'filter')
+    assert_equal 'bool', filter.keys.first
+    assert_equal 2, filter.dig('bool', 'filter').size
+  end
+
+  def test_knn_top_level_with_similarity
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      similarity 0.8
+    end
+    assert_equal 0.8, c.to_query.dig('knn', 'similarity')
+  end
+
+  def test_knn_top_level_with_min_score
+    c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      min_score 0.5
+    end
+    assert_equal 0.5, c.to_query['min_score']
+    refute c.to_query['knn'].key?('min_score')
+  end
+
+  def test_knn_hybrid_with_query
+    c = MockModel
+          .knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10)
+          .query { match :caption, 'sunset' }
+    q = c.to_query
+    assert q.key?('knn')
+    assert q.key?('query')
+    assert_equal({ 'match' => { 'caption' => 'sunset' } }, q['query'])
+  end
+
+  def test_knn_inline_in_query_block
+    c = MockModel.query do
+      knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+        filter { term 'platform', 'instagram' }
+      end
+    end
+    knn = c.to_query.dig('query', 'knn')
+    assert_equal 'image_embedding', knn['field']
+    assert_equal({ 'term' => { 'platform' => 'instagram' } }, knn['filter'])
+  end
+
+  def test_knn_filter_rejects_match
+    assert_raises(NoMethodError) do
+      MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+        filter { match :caption, 'sunset' }
+      end.to_query
+    end
+  end
+
+  # ── BoolContext clause-array injection ────────────────────────────────────
+
+  def test_bool_context_filter_accepts_clause_array
+    # Build a criteria first, then inject its clauses into a knn filter
+    c = MockModel.filter { active }.filter { term 'platform', 'instagram' }
+    knn_c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter do
+        bool do
+          filter c.filter_clauses
+        end
+      end
+    end
+    inner_filter = knn_c.to_query.dig('knn', 'filter', 'bool', 'filter')
+    assert_includes inner_filter, { 'term' => { 'status' => 'active' } }
+    assert_includes inner_filter, { 'term' => { 'platform' => 'instagram' } }
+  end
+
+  def test_bool_context_should_accepts_clause_array
+    c = MockModel.should { term 'platform', 'instagram' }.should { term 'platform', 'tiktok' }
+    knn_c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter do
+        bool do
+          should c.should_clauses
+        end
+      end
+    end
+    inner_should = knn_c.to_query.dig('knn', 'filter', 'bool', 'should')
+    assert_includes inner_should, { 'term' => { 'platform' => 'instagram' } }
+    assert_includes inner_should, { 'term' => { 'platform' => 'tiktok' } }
+  end
+
+  def test_bool_context_mixed_clause_arrays
+    filter_criteria = MockModel.filter { active }
+    should_criteria = MockModel.should { term 'type', 'video' }
+    knn_c = MockModel.knn(:image_embedding, query_vector: VEC, k: 5, num_candidates: 10) do
+      filter do
+        bool do
+          filter filter_criteria.filter_clauses
+          should should_criteria.should_clauses
+          minimum_should_match 1
+        end
+      end
+    end
+    bool_h = knn_c.to_query.dig('knn', 'filter', 'bool')
+    assert_equal [{ 'term' => { 'status' => 'active' } }], bool_h['filter']
+    assert_equal [{ 'term' => { 'type' => 'video' } }],   bool_h['should']
+    assert_equal 1, bool_h['minimum_should_match']
+  end
+
+  def test_bool_context_must_and_must_not_accept_clause_arrays
+    must_c     = MockModel.must     { term 'visible', true }
+    must_not_c = MockModel.must_not { deleted }
+    bc = Elasticsearch::Model::BoolContext.new
+    bc.must(must_c.must_clauses)
+    bc.must_not(must_not_c.must_not_clauses)
+    h = bc.to_h['bool']
+    assert_equal({ 'term' => { 'visible' => true } }, h['must'])
+    assert_equal({ 'term' => { 'status' => 'deleted' } }, h['must_not'])
   end
 
   # ── Criteria top-level params ──────────────────────────────────────────────

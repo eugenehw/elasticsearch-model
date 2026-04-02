@@ -18,9 +18,9 @@ module Elasticsearch
 
       def filter(&block)
         if block_given?
-          collector = FilterCollector.new(model_qf_mod)
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @criteria.add_filter_clauses(collector.clauses)
+          ctx = FilterContext.new(model_qf_mod)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @criteria.add_filter_clauses(ctx.clauses)
           @criteria
         else
           @criteria.filter_clauses
@@ -29,9 +29,9 @@ module Elasticsearch
 
       def must(&block)
         if block_given?
-          collector = FilterCollector.new(model_qf_mod)
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @criteria.add_must_clauses(collector.clauses)
+          ctx = MustContext.new(model_qf_mod)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @criteria.add_must_clauses(ctx.clauses)
           @criteria
         else
           @criteria.must_clauses
@@ -40,9 +40,9 @@ module Elasticsearch
 
       def should(&block)
         if block_given?
-          collector = FilterCollector.new(model_qf_mod)
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @criteria.add_should_clauses(collector.clauses)
+          ctx = ShouldContext.new(model_qf_mod)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @criteria.add_should_clauses(ctx.clauses)
           @criteria
         else
           @criteria.should_clauses
@@ -51,9 +51,9 @@ module Elasticsearch
 
       def must_not(&block)
         if block_given?
-          collector = FilterCollector.new(model_qf_mod)
-          block.arity == 0 ? collector.instance_exec(&block) : block.call(collector)
-          @criteria.add_must_not_clauses(collector.clauses)
+          ctx = MustNotContext.new(model_qf_mod)
+          block.arity.zero? ? ctx.instance_exec(&block) : block.call(ctx)
+          @criteria.add_must_not_clauses(ctx.clauses)
           @criteria
         else
           @criteria.must_not_clauses
