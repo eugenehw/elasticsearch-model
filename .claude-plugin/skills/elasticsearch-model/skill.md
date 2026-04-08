@@ -6,7 +6,7 @@ description: >
   scopes, agg_scopes, PIT pagination, or custom response classes using this gem.
 metadata:
   author: eugene
-  version: 0.1.0
+  version: 1.0.3
 ---
 
 # elasticsearch-model Ruby ODM
