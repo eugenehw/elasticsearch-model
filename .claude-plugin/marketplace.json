@@ -9,7 +9,7 @@
   },
   "plugins": [
     {
-      "version": "0.1.0",
+      "version": "1.0.3",
       "name": "elasticsearch-model",
       "source": "./skills/elasticsearch-model",
       "description": "Build Elasticsearch queries in Ruby using the elasticsearch-model ODM gem — filters, scopes, aggregations, agg_scopes, PIT pagination, and custom response classes",
