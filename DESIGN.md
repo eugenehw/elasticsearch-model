@@ -658,6 +658,80 @@ end
 
 ---
 
+## Custom Response Class
+
+`MyModel::Response < ElasticsearchResponse` is auto-detected via `response_class`.
+
+### Composable response methods
+
+Split response helpers into small methods composable via blocks.
+Block is `instance_exec`d on `self` (the Response), so callers write `total_followers(bucket: b)`
+without a `results.` prefix — the method resolves on the Response object.
+
+```ruby
+# agg_scopes — independent, composed at query time
+agg_scope :group_by_platform do |agg|
+  agg.aggregate(:group_by_platform) { terms field: 'platform', size: 50 }
+end
+
+agg_scope :total_followers do |agg|
+  agg.aggregate(:total_followers) { sum field: 'follower_count' }
+end
+
+class Response < ElasticsearchResponse
+  # `bucket: nil` — reads from top-level agg; with bucket, reads sub-agg data.
+  # Block is instance_exec'd: `{ |b| total_followers(bucket: b) }` resolves on self.
+  def group_by_platform(bucket: nil, &block)
+    src = bucket ? bucket.dig('group_by_platform', 'buckets')
+                 : aggregations.dig('group_by_platform', 'buckets')
+    return [] unless src
+
+    src.map do |b|
+      row = { platform: b['key'], count: b['doc_count'] }
+      row.merge!(instance_exec(b, &block)) if block_given?
+      row
+    end
+  end
+
+  def total_followers(bucket: nil)
+    src = bucket || aggregations
+    { total_followers: src.dig('total_followers', 'value').to_i }
+  end
+end
+```
+
+### Usage patterns
+
+```ruby
+# Plain — no sub-aggs
+MyModel.criteria.size(0).group_by_platform.search
+  .group_by_platform
+# => [{ platform: 'youtube', count: 1 }, ...]
+
+# Composed — add total_followers sub-agg per bucket via call-time block
+MyModel.criteria.size(0).group_by_platform { total_followers }.search
+  .group_by_platform { |b| total_followers(bucket: b) }
+# => [{ platform: 'youtube', count: 1, total_followers: 100_000 }, ...]
+
+# Standalone sum
+MyModel.filter { active }.size(0).total_followers.search
+  .total_followers
+# => { total_followers: 160_000 }
+```
+
+### Why `instance_exec`
+
+`row.merge!(instance_exec(b, &block))` — the block runs as if defined on the Response object.
+This lets the caller write a clean block: `{ |b| total_followers(bucket: b) }`
+rather than `{ |b| results.total_followers(bucket: b) }`.
+
+### Returning safe defaults
+
+- `group_by_platform` returns `[]` when the agg was not requested
+- `total_followers` returns `{ total_followers: 0 }` when bucket/agg has no value
+
+---
+
 ## Point-in-Time Pagination
 
 Opens a PIT, loops `search_after` pages, closes PIT in `ensure`.

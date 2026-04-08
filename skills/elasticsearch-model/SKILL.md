@@ -522,6 +522,74 @@ result.content_ids       # => [...]
 result.timeline_buckets  # => [...]
 ```
 
+### Composable response methods
+
+Split response helpers into small, composable methods that can be combined via blocks.
+Use `instance_exec(b, &block)` so inner blocks resolve method names on `self` (the Response),
+avoiding the need for `results.` prefix inside the block.
+
+```ruby
+agg_scope :group_by_platform do |agg|
+  agg.aggregate(:group_by_platform) { terms field: 'platform', size: 50 }
+end
+
+agg_scope :total_followers do |agg|
+  agg.aggregate(:total_followers) { sum field: 'follower_count' }
+end
+
+class Response < Elasticsearch::Model::ElasticsearchResponse
+  # Iterates platform buckets; merges the block result into each row.
+  # `bucket:` is for recursive/nested calls — omit when reading from top-level agg.
+  def group_by_platform(bucket: nil, &block)
+    src = bucket ? bucket.dig('group_by_platform', 'buckets')
+                 : aggregations.dig('group_by_platform', 'buckets')
+    return [] unless src
+
+    src.map do |b|
+      row = { platform: b['key'], count: b['doc_count'] }
+      row.merge!(instance_exec(b, &block)) if block_given?
+      row
+    end
+  end
+
+  # Returns { total_followers: N } from a bucket or the top-level aggregation.
+  def total_followers(bucket: nil)
+    src = bucket || aggregations
+    { total_followers: src.dig('total_followers', 'value').to_i }
+  end
+end
+```
+
+**Query:** compose agg_scopes with a call-time block to embed sub-aggs per bucket:
+
+```ruby
+# group_by_platform alone — no sub-aggs
+results = MyModel.criteria.size(0).group_by_platform.search
+results.group_by_platform
+# => [{ platform: 'youtube', count: 1 }, { platform: 'instagram', count: 2 }, ...]
+
+# group_by_platform + total_followers sub-agg (call-time block)
+results = MyModel.criteria.size(0).group_by_platform { total_followers }.search
+results.group_by_platform { |b| total_followers(bucket: b) }
+# => [{ platform: 'youtube', count: 1, total_followers: 100_000 }, ...]
+
+# total_followers standalone (across all docs)
+results = MyModel.criteria.size(0).total_followers.search
+results.total_followers
+# => { total_followers: 165_000 }
+
+# with a filter
+results = MyModel.filter { active }.size(0).total_followers.search
+results.total_followers
+# => { total_followers: 160_000 }
+```
+
+**Key points:**
+- `instance_exec(b, &block)` — block resolves `total_followers` on `self` (the Response object), no `results.` needed
+- `bucket: nil` — same method works standalone or as sub-agg reader
+- Call-time block `group_by_platform { total_followers }` embeds `total_followers` as a sub-agg on the AggBuilder
+- Returns `[]` / `{ total_followers: 0 }` if the aggregation was not requested
+
 ---
 
 ## PIT pagination

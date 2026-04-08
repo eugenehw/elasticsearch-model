@@ -111,11 +111,11 @@ class Influencer
     term 'platform', 'instagram'
   end
 
-  # Groups documents by platform; embeds total_followers as a sub-aggregation.
+  # Groups documents by platform.
+  # Add sub-agg scopes via the call-time block: .group_by_platform { total_followers }
   agg_scope :group_by_platform do |agg|
-    agg.aggregate(:group_by_platform) do |ab|
-      ab.terms field: 'platform', size: 50
-      ab.total_followers
+    agg.aggregate(:group_by_platform) do
+      terms field: 'platform', size: 50
     end
   end
 
@@ -291,16 +291,21 @@ class InfluencerIntegrationTest < Minitest::Test
   # ── Agg scopes ────────────────────────────────────────────────────────────
 
   def test_agg_scope_group_by_platform
+    # Plain — no sub-aggs
     results = Influencer.criteria.size(0).group_by_platform.search
 
     buckets = results.aggregations.dig('group_by_platform', 'buckets')
     refute_nil buckets
+    assert_includes buckets.map { |b| b['key'] }, 'instagram'
+    assert_includes buckets.map { |b| b['key'] }, 'tiktok'
+    assert_includes buckets.map { |b| b['key'] }, 'youtube'
+  end
 
-    platforms = buckets.map { |b| b['key'] }
-    assert_includes platforms, 'instagram'
-    assert_includes platforms, 'tiktok'
-    assert_includes platforms, 'youtube'
+  def test_agg_scope_group_by_platform_with_total_followers_sub_agg
+    # Composed — total_followers embedded per platform bucket via call-time block
+    results = Influencer.criteria.size(0).group_by_platform { total_followers }.search
 
+    buckets = results.aggregations.dig('group_by_platform', 'buckets')
     instagram = buckets.find { |b| b['key'] == 'instagram' }
     assert_equal 15_000, instagram.dig('total_followers', 'value').to_i
   end
@@ -333,9 +338,10 @@ class InfluencerIntegrationTest < Minitest::Test
   end
 
   def test_response_total_followers_by_platform
+    # Compose agg_scopes at query time; read composed result via response helper
     results = Influencer.criteria.size(0).group_by_platform { total_followers }.search
 
-    by_platform = results.group_by_platform { |b| results.total_followers(bucket: b) }
+    by_platform = results.group_by_platform { |b| total_followers(bucket: b) }
     assert_equal 3, by_platform.size
 
     youtube = by_platform.find { |r| r[:platform] == 'youtube' }
