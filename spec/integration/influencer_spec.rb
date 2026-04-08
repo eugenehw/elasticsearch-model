@@ -110,6 +110,53 @@ class Influencer
   scope :on_instagram do
     term 'platform', 'instagram'
   end
+
+  # Groups documents by platform; embeds total_followers as a sub-aggregation.
+  agg_scope :group_by_platform do |agg|
+    agg.aggregate(:group_by_platform) do |ab|
+      ab.terms field: 'platform', size: 50
+      ab.total_followers
+    end
+  end
+
+  # Sums follower_count across all matched documents.
+  agg_scope :total_followers do |agg|
+    agg.aggregate(:total_followers) { sum field: 'follower_count' }
+  end
+
+  class Response < Elasticsearch::Model::ElasticsearchResponse
+    # Iterates platform buckets and merges the block result into each row.
+    # Returns [] if the group_by_platform aggregation is absent.
+    #
+    # Usage (with sub-agg):
+    #   response.group_by_platform { |b| total_followers(bucket: b) }
+    #   # => [{ platform: 'youtube', count: 3, total_followers: 100_000 }, ...]
+    #
+    # Usage (plain):
+    #   response.group_by_platform
+    #   # => [{ platform: 'youtube', count: 3 }, ...]
+    def group_by_platform(bucket: nil, &block)
+      src = bucket ? bucket.dig('group_by_platform', 'buckets')
+                   : aggregations.dig('group_by_platform', 'buckets')
+      return [] unless src
+
+      src.map do |b|
+        row = { platform: b['key'], count: b['doc_count'] }
+        row.merge!(instance_exec(b, &block)) if block_given?
+        row
+      end
+    end
+
+    # Returns { total_followers: value } from a bucket or the top-level aggregation.
+    # Designed to be composed inside group_by_platform's block.
+    #
+    # Usage as sub-agg:   total_followers(bucket: b)
+    # Usage standalone:   total_followers
+    def total_followers(bucket: nil)
+      src = bucket || aggregations
+      { total_followers: src.dig('total_followers', 'value').to_i }
+    end
+  end
 end
 
 # ── Shared fixtures ───────────────────────────────────────────────────────────
@@ -239,6 +286,75 @@ class InfluencerIntegrationTest < Minitest::Test
     avg_val = results.aggregations.dig('avg_followers', 'value')
     refute_nil avg_val
     assert avg_val > 0
+  end
+
+  # ── Agg scopes ────────────────────────────────────────────────────────────
+
+  def test_agg_scope_group_by_platform
+    results = Influencer.criteria.size(0).group_by_platform.search
+
+    buckets = results.aggregations.dig('group_by_platform', 'buckets')
+    refute_nil buckets
+
+    platforms = buckets.map { |b| b['key'] }
+    assert_includes platforms, 'instagram'
+    assert_includes platforms, 'tiktok'
+    assert_includes platforms, 'youtube'
+
+    instagram = buckets.find { |b| b['key'] == 'instagram' }
+    assert_equal 15_000, instagram.dig('total_followers', 'value').to_i
+  end
+
+  def test_agg_scope_total_followers
+    results = Influencer.criteria.size(0).total_followers.search
+
+    total = results.aggregations.dig('total_followers', 'value').to_i
+    assert_equal 165_000, total
+  end
+
+  def test_agg_scope_total_followers_with_filter
+    results = Influencer.filter { active }.size(0).total_followers.search
+
+    total = results.aggregations.dig('total_followers', 'value').to_i
+    assert_equal 160_000, total  # excludes bob jones (inactive, 5_000)
+  end
+
+  def test_response_group_by_platform_plain
+    results = Influencer.criteria.size(0).group_by_platform.search
+
+    assert_instance_of Influencer::Response, results
+
+    rows = results.group_by_platform
+    assert_equal 3, rows.size
+    assert rows.all? { |r| r.key?(:platform) && r.key?(:count) }
+
+    instagram = rows.find { |r| r[:platform] == 'instagram' }
+    assert_equal 2, instagram[:count]
+  end
+
+  def test_response_total_followers_by_platform
+    results = Influencer.criteria.size(0).group_by_platform { total_followers }.search
+
+    by_platform = results.group_by_platform { |b| results.total_followers(bucket: b) }
+    assert_equal 3, by_platform.size
+
+    youtube = by_platform.find { |r| r[:platform] == 'youtube' }
+    assert_equal({ platform: 'youtube', count: 1, total_followers: 100_000 }, youtube)
+
+    instagram = by_platform.find { |r| r[:platform] == 'instagram' }
+    assert_equal({ platform: 'instagram', count: 2, total_followers: 15_000 }, instagram)
+  end
+
+  def test_response_total_followers_standalone
+    results = Influencer.criteria.size(0).total_followers.search
+
+    assert_equal({ total_followers: 165_000 }, results.total_followers)
+  end
+
+  def test_response_group_by_platform_returns_empty_without_agg
+    results = Influencer.criteria.size(0).search
+
+    assert_equal [], results.group_by_platform
   end
 
   # ── Pagination ────────────────────────────────────────────────────────────
